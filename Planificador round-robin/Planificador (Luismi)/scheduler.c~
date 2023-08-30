@@ -1,0 +1,229 @@
+//------------------------------------------------------------------------------
+// Grado en Ingenieria Informatica
+// Curso academico 2013/2014
+// Sistemas Operativos (laboratorio)
+//------------------------------------------------------------------------------
+// ejemrr2p: otro ejemplo sobre ejecucion fraccionada de dos procesos;
+//           proceso de control reparte el tiempo igualmente entre procesos
+//           subordinados hasta que ambos terminen.
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Ficheros de cabecera
+//------------------------------------------------------------------------------
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <time.h>
+#include <wait.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <errno.h>
+#include <limits.h>
+#include <time.h>
+#include "fragmenta.h"	
+//------------------------------------------------------------------------------
+// Constantes de preproceso
+//------------------------------------------------------------------------------
+#define TRUE  1
+#define FALSE 0
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// Información de cada proceso que se guarda en la cola
+typedef struct {
+	pid_t pid;  // Identificador de proceso
+	int quanto;	// Cuanto de tiempo particular
+} process_info_t;
+
+// Estructura de mensaje
+typedef struct {
+	long int id; // Identificador de tipo de mensaje
+	process_info_t pinfo;
+} mensaje_t;
+//------------------------------------------------------------------------------
+// Prototipos de funciones usadas en funcion main()
+//------------------------------------------------------------------------------
+void process_loading (int const, int const); // Lectura y creación de procesos a ejecutar
+void rotative_scheduling (int const); // Planificación rotativa
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Prototipos de funciones para manejo de señal
+//------------------------------------------------------------------------------
+void controlar_fin (int);
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// Variables usadas por funciones manejadoras de señal
+//------------------------------------------------------------------------------
+// Variable bandera empleada para indicar terminacion de proceso hijo a proceso
+// de control.
+int fin;
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Funcion main()
+//------------------------------------------------------------------------------
+int main (int argc, char* argv[]) {
+
+	// Se comprueba los argumentos pasados por la linea de ordenes
+	if (argc != 1) {
+
+		fprintf(stderr, "Uso: %s \n", argv[0]);
+		exit(1);
+
+	}
+
+	int quanto;
+	
+  // Creacion de la cola de mensajes
+  srand(time(NULL));
+  key_t const key = ftok(argv[0], rand());
+  int const id_msgq = msgget(key, IPC_CREAT | IPC_EXCL | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+  if (id_msgq == -1) {
+	perror("Error al crear cola de mensajes");
+	exit(1);
+    }
+    
+ // Creacion de procesos y encolado de información en cola de mensajes
+  process_loading(id_msgq, quanto);
+  // Ejecución rotativa hasta que terminen todos los procesos
+  rotative_scheduling(id_msgq);
+  // Se elimina la cola de mensajes
+  msgctl(id_msgq, IPC_RMID, 0);
+
+  return 0;
+
+}
+
+//------------------------------------------------------------------------------
+// Definicion de funcion process_loading()
+// Se ocupa de leer las ordenes que llegan por la entrada estandar.
+// Crea cada proceso y carga su información para control en la cola de mensajes.
+//------------------------------------------------------------------------------
+void process_loading (int const msgq, int quanto) {
+
+  // Se pide memoria para la linea de lectura de ordenes por teclado
+  char* const cadena = (char*) malloc(100 * sizeof(char));
+  
+  puts("Introduzca: <quanto> <instrucción>\nPara ejecutar pulse Ctrl+d.\n");
+  while (scanf("%i %[^\n]",&quanto,cadena) != EOF) {
+	  // Consume caracter salto de linea residual en buffer
+          getchar();
+	  process_info_t pinfo;
+	  pinfo.quanto=quanto;
+    // Se emplea un array de tokens para fragmentar la linea leida
+	  char** tokens;
+	  tokens = fragmenta(cadena);
+
+    // Se crea un proceso subordinado para ejecutar la orden
+	  pinfo.pid=fork();
+
+	  if (pinfo.pid == -1) {
+
+		perror("Error al crear proceso hijo");
+		exit(-1);
+
+	  }
+
+	  if (pinfo.pid == 0) { // Proceso hijo
+
+		// Se autodetiene proceso hijo
+		kill(getpid(), SIGSTOP);
+
+		// Si tokens[0] se localiza sin problemas, el proceso hijo
+		// termina su ejecución sin necesidad de exit(0);
+		if (execvp(tokens[0], tokens) == -1) {
+
+			fprintf(stderr, "Programa %s no encontrado\n", tokens[0]);
+			exit(2); // Necesario cuando se introduce una orden desconocida para el intérprete bash
+
+		}
+
+		}
+		else { // Proceso padre
+
+			// Prepara mensaje con informacioon de proceso subordinado
+			mensaje_t m;
+			m.id = 1;
+			m.pinfo=pinfo;
+			// Encola mensaje
+			msgsnd(msgq, &m, sizeof(process_info_t), 0);
+		}
+
+	  // Se devuelve memoria ocupada por estructura de tokens.
+	  borrarg(tokens);
+  }
+
+ // Se devuelve memoria usada para leer línea de entrada por teclado.
+ free(cadena);
+
+}
+
+//------------------------------------------------------------------------------
+// Definicion de funcion rotative_scheduling()
+//------------------------------------------------------------------------------
+void rotative_scheduling (int const msgq) {
+
+  // Se configura la atencion de la señal SIGCHLD.
+  struct sigaction s;
+  s.sa_handler = controlar_fin;
+  //sigemptyset(&s.sa_mask);
+  s.sa_flags = SA_NOCLDSTOP;
+  if (sigaction(SIGCHLD, &s, NULL) == -1) {
+
+    perror("Error en la activacion del manejador SIGCHLD");
+    exit(-2);
+
+  }
+  
+  // Itera hasta que no haya procesos en la cola.
+  mensaje_t m;
+  while (msgrcv(msgq, &m, sizeof(process_info_t), 1, IPC_NOWAIT) > 0) {
+    
+	// Se apaga bandera de fin de proceso
+	fin = FALSE;
+
+	// Se despierta al proceso
+	kill(m.pinfo.pid, SIGCONT);
+
+	// Se deja pasar el tiempo del cuanto
+	sleep(m.pinfo.quanto);
+
+	// Se comprueba causa del despertar
+	if (fin == FALSE) { // Proceso hijo activo ha finalizado durante el cuanto
+
+		// Se interrumpe al proceso
+		kill(m.pinfo.pid, SIGSTOP);
+		// No ha terminado; en consecuencia, se encola de nuevo
+		msgsnd(msgq, &m, sizeof(process_info_t), 0);
+	}
+
+
+  }
+
+  puts("Finalizaron todos los procesos");
+
+}
+//------------------------------------------------------------------------------
+// Definicion de funcion controlar_fin()
+// Manejador de señal SIGCHLD para proceso planificador
+//------------------------------------------------------------------------------
+void controlar_fin (int x) {
+
+	pid_t const id = getpid();
+
+	printf("Proceso %4i: SIGCHLD recibida\n", id);
+
+	// Proceso hijo ha finalizado.
+	// Indicador de terminacion se pone a TRUE.
+	fin = TRUE;
+
+}
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
